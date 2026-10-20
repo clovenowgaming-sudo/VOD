@@ -1,0 +1,197 @@
+#pragma once
+
+#include <matjson.hpp>
+#include "ModPatch.hpp"
+#include <Geode/loader/Loader.hpp>
+#include <Geode/loader/ModSettingsManager.hpp>
+#include <Geode/utils/ZStringView.hpp>
+#include <Geode/loader/Signal.hpp>
+
+namespace geode {
+    enum class SaveRequestState {
+        Clean,
+        SaveOnce,
+        SaveUntilExit,
+    };
+
+    class Mod::Impl {
+    public:
+        Mod* m_self;
+        /**
+         * Mod metadata
+         */
+        ModMetadata m_metadata;
+        /**
+         * Platform-specific info
+         */
+        PlatformInfo* m_platformInfo = nullptr;
+        /**
+         * Hooks owned by this mod
+         */
+        std::vector<std::shared_ptr<Hook>> m_hooks;
+        /**
+         * Patches owned by this mod
+         */
+        std::vector<std::shared_ptr<Patch>> m_patches;
+        /**
+         * Whether the mod is loaded or not
+         */
+        bool m_loaded = false;
+        /**
+         * Mod temp directory name
+         */
+        std::filesystem::path m_tempDirName;
+        /**
+         * Mod save directory name
+         */
+        std::filesystem::path m_saveDirPath;
+        /**
+         * Pointers to mods that depend on this Mod.
+         * Makes it possible to enable / disable them automatically,
+         * when their dependency is disabled.
+         */
+        std::vector<Mod*> m_dependants;
+        /**
+         * Saved values
+         */
+        matjson::Value m_saved = matjson::Value();
+        /**
+         * Whether the saved values need to be saved to disk one time
+         * (container dirty)
+         */
+        SaveRequestState m_saveRequestState = SaveRequestState::Clean;
+        /**
+         * Setting values. This is behind unique_ptr for interior mutability
+         */
+        std::unique_ptr<ModSettingsManager> m_settings = nullptr;
+        /**
+         * Setting observer.
+         */
+        comm::Observer m_settingObserver;
+        /**
+         * Whether the mod resources are loaded or not
+         */
+        bool m_resourcesLoaded = false;
+        /**
+         * Whether logging is enabled for this mod
+         */
+        bool m_loggingEnabled = true;
+        /**
+         * The minimum log level for this mod
+         */
+        Severity m_logLevel = Severity::Trace;
+        std::unordered_map<std::string, char const*> m_expandedSprites;
+        bool m_isCurrentlyLoading = false;
+        ModRequestedAction m_requestedAction = ModRequestedAction::None;
+        std::optional<LoadProblem> m_problem;
+
+        Impl(Mod* self, ModMetadata const& metadata);
+        ~Impl();
+        Impl(Impl const&) = delete;
+        Impl(Impl&&) = delete;
+
+        Result<> setup();
+
+        Result<> loadPlatformBinary();
+        Result<> createTempDir();
+
+        ZStringView getID() const;
+        ZStringView getName() const;
+        std::vector<std::string> const& getDevelopers() const;
+        std::optional<std::string> const& getDescription() const;
+        std::optional<std::string> const& getDetails() const;
+        std::filesystem::path getPackagePath() const;
+        VersionInfo getVersion() const;
+        bool isLoaded() const;
+        bool isInternal() const;
+        bool isInvalid() const;
+        bool needsEarlyLoad(std::vector<Mod*>& checked) const;
+        ModMetadata const& getMetadata() const;
+        std::filesystem::path getTempDir() const;
+        std::filesystem::path getBinaryPath() const;
+
+        /**
+         * If a mod should be considered ephemeral, in which case it will not attempt to save/load its data.
+         * Currently used for the invalid mod objects.
+         */
+        bool isEphemeral() const;
+
+        matjson::Value& getSaveContainer();
+        matjson::Value& getSaveContainerTemp();
+        matjson::Value const& getSaveContainerConst() const;
+
+#if defined(GEODE_EXPOSE_SECRET_INTERNALS_IN_HEADERS_DO_NOT_DEFINE_PLEASE)
+        void setMetadata(ModMetadata const& metadata);
+        std::vector<Mod*> getDependants() const;
+        std::vector<Mod*> getEnabledDependants() const;
+#endif
+
+        Result<> saveData();
+        Result<> loadData();
+
+        std::filesystem::path getSaveDir() const;
+        std::filesystem::path getConfigDir(bool create = true) const;
+        std::filesystem::path getPersistentDir(bool create = true) const;
+
+        bool hasSettings() const;
+        std::vector<std::string> getSettingKeys() const;
+        bool hasSetting(std::string_view key) const;
+        void settingReact(geode::Function<void()> fn);
+
+        std::string getLaunchArgumentName(std::string_view name) const;
+        std::vector<std::string> getLaunchArgumentNames() const;
+        bool hasLaunchArgument(std::string_view name) const;
+        std::optional<std::string> getLaunchArgument(std::string_view name) const;
+        bool getLaunchFlag(std::string_view name) const;
+
+        Result<Hook*> claimHook(std::shared_ptr<Hook> hook);
+        Result<> disownHook(Hook* hook);
+        [[nodiscard]] std::vector<Hook*> getHooks() const;
+
+        Result<Patch*> claimPatch(std::shared_ptr<Patch> patch);
+        Result<> disownPatch(Patch* patch);
+        [[nodiscard]] std::vector<Patch*> getPatches() const;
+
+        Result<> enable();
+        Result<> disable();
+        Result<> uninstall(bool deleteSaveData = false);
+        bool isUninstalled() const;
+
+        // 1.3.0 additions
+        ModRequestedAction getRequestedAction() const;
+
+        bool depends(std::string_view id) const;
+        Result<> updateDependencies();
+        bool hasUnresolvedDependencies() const;
+        bool hasUnresolvedIncompatibilities() const;
+
+        Result<> loadBinary();
+
+        std::string expandSpriteName(std::string_view name);
+        ModJson getRuntimeInfo() const;
+
+        bool isLoggingEnabled() const;
+        void setLoggingEnabled(bool enabled);
+        Severity getLogLevel() const;
+        void setLogLevel(Severity level);
+
+        bool shouldLoad() const;
+        bool isCurrentlyLoading() const;
+
+        int getLoadPriority() const;
+
+        bool isPinned() const;
+        void setPinned(bool pinned);
+
+        // native binary loading
+        void addNativeBinariesPath(std::filesystem::path const& path);
+        void loadNativeModBinaries();
+    };
+
+    class ModImpl : public Mod::Impl {
+    public:
+        static Mod::Impl* get();
+
+        static Mod::Impl* getImpl(Mod* mod);
+    };
+}

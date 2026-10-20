@@ -1,0 +1,172 @@
+#pragma once
+
+#include <filesystem>
+#include <Geode/Result.hpp>
+#include "Log.hpp"
+#include "ModEvent.hpp"
+#include "ModMetadata.hpp"
+#include "Types.hpp"
+
+#include <atomic>
+#include <matjson.hpp>
+#include <mutex>
+#include <optional>
+#include <string_view>
+
+namespace geode {
+    using ScheduledFunction = geode::Function<void()>;
+
+    struct LoadProblem {
+        enum class Type : uint8_t {
+            /// Some other fatal error (like binary loading failing)
+            Unknown = 0,
+            /// This mod has an invalid .geode package
+            InvalidGeodeFile = 1,
+            /// This mod is missing dependencies
+            MissingDependencies = 2,
+            /// This mod is outdated (targets an old GD or Geode version)
+            Outdated = 3,
+            /// This mod is explicitly incompatible with another mod
+            HasIncompatibilities = 4,
+        };
+        Type type;
+        std::variant<std::filesystem::path, ModMetadata, Mod*> cause;
+        /// Human-readable message (that should also suggest a fix; aka be UI-ready)
+        std::string message;
+
+        // Outdated mods are not shown in main menu
+        bool isProblemTheUserShouldCareAbout() const {
+            return type != Type::Outdated;
+        }
+    };
+
+    class LoaderImpl;
+
+    class GEODE_DLL Loader final {
+    private:
+        class Impl;
+        std::unique_ptr<Impl> m_impl;
+        Loader();
+        ~Loader();
+
+    protected:
+        Mod* takeNextMod();
+
+    public:
+        static Loader* get();
+
+        enum class LoadingState : uint8_t {
+            None,
+            Queue,
+            List,
+            Graph,
+            EarlyMods,
+            Mods,
+            Problems,
+            Done
+        };
+
+        bool isForwardCompatMode();
+
+        void saveData();
+        void loadData();
+
+        VersionInfo getVersion();
+        VersionInfo minModVersion();
+        VersionInfo maxModVersion();
+        bool isModVersionSupported(VersionInfo const& version);
+
+        LoadingState getLoadingState();
+        bool isModInstalled(std::string_view id) const;
+        Mod* getInstalledMod(std::string_view id) const;
+        bool isModLoaded(std::string_view id) const;
+        Mod* getLoadedMod(std::string_view id) const;
+        std::vector<Mod*> getAllMods();
+        std::vector<LoadProblem> getLoadProblems() const;
+
+        /**
+         * Returns the available launch argument names.
+         */
+        std::vector<std::string> getLaunchArgumentNames() const;
+        /**
+         * Returns whether the specified launch argument was passed in via the command line.
+         * @param name The argument name
+         */
+        bool hasLaunchArgument(std::string_view name) const;
+        /**
+         * Get a launch argument. These are passed into the game as command-line arguments
+         * with the format `--geode:arg-name=value`.
+         * @param name The argument name
+         * @return The value, if present
+         */
+        std::optional<std::string> getLaunchArgument(std::string_view name) const;
+        /**
+         * Get a launch argument flag. Returns whether the argument is present and its
+         * value is exactly `true`.
+         * @param name The argument name
+         */
+        bool getLaunchFlag(std::string_view name) const;
+        /**
+         * Get and parse a launch argument value using the setting value system.
+         * @param name The argument name
+         */
+        template <class T>
+        Result<T> parseLaunchArgument(std::string_view name) const {
+            auto str = this->getLaunchArgument(name);
+            if (!str.has_value()) {
+                return Err(fmt::format("Launch argument '{}' not found", name));
+            }
+            auto jsonOpt = matjson::Value::parse(str.value());
+            if (jsonOpt.isErr()) {
+                return Err(fmt::format("Parsing launch argument '{}' failed: {}", name, jsonOpt.unwrapErr()));
+            }
+            auto value = jsonOpt.unwrap();
+            return value.template as<T>();
+        }
+
+        void queueInMainThread(ScheduledFunction&& func);
+
+        /**
+         * Returns the current game version.
+         * @return The game version
+         */
+        std::string getGameVersion();
+
+        /**
+         * Returns whether the loader does not use dynamic patching or hooking.
+         * You should use GEODE_MOD_STATIC_PATCH macro instead of Mod::patch and
+         * GEODE_MOD_STATIC_HOOK macro instead of Mod::hook if that is the case.
+         * Modify classes are handled automatically, and enabling/disabling hooks
+         * works fine too.
+         * @return True if the loader does not use dynamic patching or hooking,
+         * false if it does.
+         */
+        bool isPatchless() const;
+
+        friend class LoaderImpl;
+
+        friend Mod* takeNextLoaderMod();
+    };
+
+    /**
+     * @brief Queues a function to run on the main thread
+     *
+     * @param func the function to queue
+    */
+    inline void queueInMainThread(ScheduledFunction&& func) {
+        Loader::get()->queueInMainThread(std::move(func));
+    }
+
+    /**
+     * @brief Take the next mod to load
+     *
+     * @return Mod* The next mod to load
+    */
+    inline Mod* takeNextLoaderMod() {
+        return Loader::get()->takeNextMod();
+    }
+
+    struct LoaderUpdateModResourcesEvent final : Event<LoaderUpdateModResourcesEvent, bool(std::vector<Mod*>)> {
+        using Event::Event;
+    };
+}

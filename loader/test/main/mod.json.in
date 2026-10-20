@@ -1,0 +1,20 @@
+{
+    "geode":        "@GEODE_VERSION_FULL@",
+    "gd": {
+        "win": "*",
+        "mac": "*",
+        "android": "*",
+        "ios": "*"
+    },
+	"version":      "1.0.0",
+	"id":           "geode.test",
+    "name":         "Geode Test",
+    "developer":    "Geode Team",
+    "description":  "unit test for geode",
+    "dependencies": {
+        "geode.testdep": {
+            "version": ">=1.0.0",
+            "required": true
+        }
+    }
+}

@@ -1,0 +1,9 @@
+build/
+bin/
+cpm-cache/
+launcher/.gradle/
+launcher/app/build/
+launcher/app/.cxx/
+launcher/app/src/main/jniLibs/
+launcher/app/src/main/assets/geode-resources/
+*.apk
