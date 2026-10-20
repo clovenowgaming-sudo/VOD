@@ -1,0 +1,12 @@
+<resources>
+    <style name="Theme.Vod" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/vod_bg</item>
+        <item name="android:statusBarColor">@color/vod_bg</item>
+        <item name="android:navigationBarColor">@color/vod_bg</item>
+        <item name="android:colorAccent">@color/vod_accent</item>
+    </style>
+    <style name="Theme.Vod.Game" parent="android:Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

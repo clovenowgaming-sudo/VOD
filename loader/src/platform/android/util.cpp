@@ -1,0 +1,560 @@
+#include <Geode/utils/cocos.hpp>
+#include <Geode/loader/Dirs.hpp>
+#include <Geode/utils/file.hpp>
+#include <Geode/utils/web.hpp>
+#include <filesystem>
+#include <Geode/utils/general.hpp>
+#include <Geode/utils/permission.hpp>
+#include <Geode/loader/Loader.hpp>
+#include <Geode/binding/AppDelegate.hpp>
+#include <Geode/loader/Log.hpp>
+#include <Geode/binding/MenuLayer.hpp>
+#include <Geode/Result.hpp>
+#include <Geode/DefaultInclude.hpp>
+#include <Geode/utils/AndroidEvent.hpp>
+#include <arc/sync/oneshot.hpp>
+#include <optional>
+#include <mutex>
+#include <string.h>
+#include <unistd.h>
+#include <sys/system_properties.h>
+#include <jni.h>
+#include <Geode/cocos/platform/android/jni/JniHelper.h>
+
+using namespace geode::prelude;
+
+using geode::utils::permission::Permission;
+
+bool utils::clipboard::write(ZStringView data) {
+    JniMethodInfo t;
+    if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "writeClipboard", "(Ljava/lang/String;)V")) {
+        jstring stringArg1 = t.env->NewStringUTF(data.c_str());
+
+        t.env->CallStaticVoidMethod(t.classID, t.methodID, stringArg1);
+
+        t.env->DeleteLocalRef(stringArg1);
+        t.env->DeleteLocalRef(t.classID);
+        return true;
+    }
+    return false;
+}
+
+std::string utils::clipboard::read() {
+    JniMethodInfo t;
+    if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "readClipboard", "()Ljava/lang/String;")) {
+        jstring stringResult = (jstring)t.env->CallStaticObjectMethod(t.classID, t.methodID);
+
+        std::string result = JniHelper::jstring2string(stringResult);
+
+        t.env->DeleteLocalRef(stringResult);
+        t.env->DeleteLocalRef(t.classID);
+        return result;
+    }
+    return "";
+}
+
+CCPoint cocos::getMousePos() {
+    return CCPoint(0, 0);
+}
+
+namespace {
+    void clearJNIException() {
+        // this is a silly workaround to not crash when the method is not found.
+        // cocos figured this out half a year later...
+        auto vm = JniHelper::getJavaVM();
+
+        JNIEnv* env;
+        if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK) {
+            env->ExceptionClear();
+        }
+    }
+
+    // jni breaks over multithreading, so the value is stored to avoid more jni calls
+    std::string s_savedBaseDir = "";
+
+    std::filesystem::path getBaseDir() {
+        std::string path = "/storage/emulated/0/Android/data/com.vod.launcher/files";
+
+        if (!s_savedBaseDir.empty()) {
+            return std::filesystem::path(s_savedBaseDir);
+        }
+
+        JniMethodInfo t;
+        if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "getBaseDirectory", "()Ljava/lang/String;")) {
+            jstring str = reinterpret_cast<jstring>(t.env->CallStaticObjectMethod(t.classID, t.methodID));
+            t.env->DeleteLocalRef(t.classID);
+            path = JniHelper::jstring2string(str);
+            t.env->DeleteLocalRef(str);
+        } else {
+            clearJNIException();
+        }
+
+        s_savedBaseDir = path;
+        return std::filesystem::path(path);
+    }
+}
+
+std::filesystem::path dirs::getGameDir() {
+    return getBaseDir() / "game";
+}
+
+std::filesystem::path dirs::getSaveDir() {
+    return getBaseDir() / "save";
+}
+
+std::filesystem::path dirs::getModRuntimeDir() {
+    static std::string cachedResult = [] {
+        // incase the jni fails, default to this
+        std::string path = "/data/user/0/com.vod.launcher/files/";
+
+        JniMethodInfo t;
+        if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "getInternalDirectory", "()Ljava/lang/String;")) {
+            jstring str = reinterpret_cast<jstring>(t.env->CallStaticObjectMethod(t.classID, t.methodID));
+            t.env->DeleteLocalRef(t.classID);
+            path = JniHelper::jstring2string(str);
+            t.env->DeleteLocalRef(str);
+        } else {
+            clearJNIException();
+        }
+
+        return path;
+    }();
+    return std::filesystem::path(cachedResult) / "geode" / "unzipped";
+}
+
+std::filesystem::path dirs::getResourcesDir() {
+    return "assets";
+}
+
+void utils::web::openLinkUnsafe(ZStringView url) {
+    JniMethodInfo t;
+    if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "openWebview", "(Ljava/lang/String;)V")) {
+        jstring urlArg = t.env->NewStringUTF(url.c_str());
+
+        t.env->CallStaticVoidMethod(t.classID, t.methodID, urlArg);
+
+        t.env->DeleteLocalRef(urlArg);
+        t.env->DeleteLocalRef(t.classID);
+    } else {
+        clearJNIException();
+        CCApplication::sharedApplication()->openURL(url.c_str());
+    }
+}
+
+bool utils::file::openFolder(std::filesystem::path const& path) {
+    JniMethodInfo t;
+    if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "openFolder", "(Ljava/lang/String;)Z")) {
+        jstring stringArg1 = t.env->NewStringUTF(utils::string::pathToString(path).c_str());
+
+        jboolean result = t.env->CallStaticBooleanMethod(t.classID, t.methodID, stringArg1);
+
+        t.env->DeleteLocalRef(stringArg1);
+        t.env->DeleteLocalRef(t.classID);
+        return result;
+    }
+    return false;
+}
+
+std::mutex s_callbackMutex;
+static std::optional<arc::oneshot::Sender<file::PickResult>> s_fileTx {};
+static std::optional<arc::oneshot::Sender<file::PickManyResult>> s_filesTx {};
+
+extern "C"
+JNIEXPORT void JNICALL Java_com_vod_launcher_utils_GeodeUtils_selectFileCallback(
+        JNIEnv *env,
+        jobject,
+        jstring data
+) {
+    auto isCopy = jboolean();
+    auto dataStr = env->GetStringUTFChars(data, &isCopy);
+
+    const std::lock_guard lock(s_callbackMutex);
+    if (s_fileTx) {
+        (void) s_fileTx->send(Ok(std::filesystem::path(dataStr)));
+        s_fileTx.reset();
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL Java_com_vod_launcher_utils_GeodeUtils_selectFilesCallback(
+        JNIEnv *env,
+        jobject,
+        jobjectArray datas
+) {
+    auto isCopy = jboolean();
+    auto count = env->GetArrayLength(datas);
+    auto result = std::vector<std::filesystem::path>();
+    result.reserve(count);
+    for (int i = 0; i < count; i++) {
+        auto data = (jstring)env->GetObjectArrayElement(datas, i);
+        auto dataStr = env->GetStringUTFChars(data, &isCopy);
+        result.push_back(dataStr);
+    }
+    const std::lock_guard lock(s_callbackMutex);
+    if (s_filesTx) {
+        (void) s_filesTx->send(Ok(std::move(result)));
+        s_filesTx.reset();
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL Java_com_vod_launcher_utils_GeodeUtils_failedCallback(
+        JNIEnv *env,
+        jobject
+) {
+    const std::lock_guard lock(s_callbackMutex);
+    if (s_fileTx) {
+        (void) s_fileTx->send(Err("Permission error"));
+        s_fileTx.reset();
+    }
+    if (s_filesTx) {
+        (void) s_filesTx->send(Err("Permission error"));
+        s_filesTx.reset();
+    }
+}
+
+arc::Future<file::PickResult> file::pick(file::PickMode mode, file::FilePickOptions options) {
+    std::unique_lock lock(s_callbackMutex);
+    if (s_fileTx || s_filesTx) {
+        co_return Err("File picker was already called this frame");
+    }
+
+    ZStringView method;
+    switch (mode) {
+        case file::PickMode::OpenFile:
+            method = "selectFile";
+            break;
+        case file::PickMode::SaveFile:
+            method = "createFile";
+            break;
+        case file::PickMode::OpenFolder:
+            method = "selectFolder";
+            break;
+    }
+
+    auto result = co_await waitForMainThread<Result<>>([&] -> Result<> {
+        JniMethodInfo t;
+        if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", method.c_str(), "(Ljava/lang/String;)Z")) {
+            jstring stringArg1 = t.env->NewStringUTF(
+                utils::string::pathToString(options.defaultPath.value_or(std::filesystem::path()).filename()).c_str()
+            );
+
+            jboolean result = t.env->CallStaticBooleanMethod(t.classID, t.methodID, stringArg1);
+
+            t.env->DeleteLocalRef(stringArg1);
+            t.env->DeleteLocalRef(t.classID);
+            if (!result) {
+                return Err("Failed to open file picker");
+            }
+            return Ok();
+        }
+        return Err("Failed to find file picker method");
+    });
+    GEODE_CO_UNWRAP(result.value());
+
+    auto [tx, rx] = arc::oneshot::channel<file::PickResult>();
+    s_fileTx = std::move(tx);
+
+    lock.unlock();
+    auto res = co_await rx.recv();
+    lock.lock();
+
+    if (!res) {
+        co_return Err("file picker sender was destroyed");
+    }
+    co_return std::move(res).unwrap();
+}
+
+arc::Future<file::PickManyResult> file::pickMany(FilePickOptions options) {
+    std::unique_lock lock(s_callbackMutex);
+    if (s_fileTx || s_filesTx) {
+        co_return Err("File picker was already called this frame");
+    }
+
+    auto result = co_await waitForMainThread<Result<>>([&] -> Result<> {
+        JniMethodInfo t;
+        if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "selectFiles", "(Ljava/lang/String;)Z")) {
+            jstring stringArg1 = t.env->NewStringUTF(
+                utils::string::pathToString(options.defaultPath.value_or(std::filesystem::path())).c_str()
+            );
+
+            jboolean result = t.env->CallStaticBooleanMethod(t.classID, t.methodID, stringArg1);
+
+            t.env->DeleteLocalRef(stringArg1);
+            t.env->DeleteLocalRef(t.classID);
+            if (!result) {
+                return Err("Failed to open file dialog");
+            }
+            return Ok();
+        }
+        return Err("Failed to find file picker method");
+    });
+    GEODE_CO_UNWRAP(result.value());
+
+    auto [tx, rx] = arc::oneshot::channel<file::PickManyResult>();
+    s_filesTx = std::move(tx);
+
+    lock.unlock();
+    auto res = co_await rx.recv();
+    lock.lock();
+
+    if (!res) {
+        co_return Err("file picker sender was destroyed");
+    }
+    co_return std::move(res).unwrap();
+}
+
+void geode::utils::game::launchLoaderUninstaller(bool deleteSaveData) {
+    log::error("Launching Geode uninstaller is not supported on android");
+}
+
+void geode::utils::game::exit(bool save) {
+    // TODO: yeah
+    // if (CCApplication::sharedApplication() &&
+    //     (GameManager::get()->m_playLayer || GameManager::get()->m_levelEditorLayer)) {
+    //     log::error("Cannot exit in PlayLayer or LevelEditorLayer!");
+    //     return;
+    // }
+    if (save) {
+        AppDelegate::get()->trySaveGame(true);
+    }
+    // AppDelegate::get()->showLoadingCircle(false, true);
+
+    CCDirector::get()->getActionManager()->addAction(CCSequence::create(
+        CCDelayTime::create(0.5f),
+        CCCallFunc::create(nullptr, callfunc_selector(MenuLayer::endGame)),
+        nullptr
+    ), CCDirector::get()->getRunningScene(), false);
+}
+
+void geode::utils::game::restart(bool save) {
+    // if (CCApplication::sharedApplication() &&
+    //     (GameManager::get()->m_playLayer || GameManager::get()->m_levelEditorLayer)) {
+    //     log::error("Cannot restart in PlayLayer or LevelEditorLayer!");
+    //     return;
+    // }
+
+    class Exit : public CCObject {
+    public:
+        void restart() {
+            JniMethodInfo t;
+            if (JniHelper::getStaticMethodInfo(t, "com/vod/launcher/utils/GeodeUtils", "restartGame", "()V")) {
+                t.env->CallStaticVoidMethod(t.classID, t.methodID);
+
+                t.env->DeleteLocalRef(t.classID);
+            }
+        }
+    };
+    // Not implemented
+    // log::error("Restarting the game is not implemented on android");
+
+    if (save) {
+        AppDelegate::get()->trySaveGame(true);
+    }
+    // AppDelegate::get()->showLoadingCircle(false, true);
+
+    CCDirector::get()->getActionManager()->addAction(CCSequence::create(
+        CCDelayTime::create(0.5f),
+        CCCallFunc::create(nullptr, callfunc_selector(Exit::restart)),
+        nullptr
+    ), CCDirector::get()->getRunningScene(), false);
+}
+
+static const char* permissionToName(Permission permission) {
+#define PERM(x) "android.permission." x
+#define INTERNAL_PERM(x) "geode.permission_internal." x
+    switch (permission) {
+    case Permission::RecordAudio: return PERM("RECORD_AUDIO");
+    case Permission::ReadAllFiles: return INTERNAL_PERM("MANAGE_ALL_FILES");
+    }
+#undef PERM
+#undef INTERNAL_PERM
+}
+
+bool geode::utils::permission::getPermissionStatus(Permission permission) {
+    JniMethodInfo info;
+    if (JniHelper::getStaticMethodInfo(info, "com/vod/launcher/utils/GeodeUtils", "getPermissionStatus", "(Ljava/lang/String;)Z")) {
+        jstring permString = info.env->NewStringUTF(permissionToName(permission));
+        jboolean result = info.env->CallStaticBooleanMethod(info.classID, info.methodID, permString);
+        info.env->DeleteLocalRef(info.classID);
+        info.env->DeleteLocalRef(permString);
+
+        return result == JNI_TRUE;
+    } else {
+        clearJNIException();
+    }
+
+    return false;
+}
+
+static geode::Function<void(bool)> s_permissionCallback;
+
+extern "C"
+JNIEXPORT void JNICALL Java_com_vod_launcher_utils_GeodeUtils_permissionCallback(
+        JNIEnv* env,
+        jobject,
+        jboolean granted
+) {
+    if (s_permissionCallback) {
+        Loader::get()->queueInMainThread([granted] {
+            s_permissionCallback(granted == JNI_TRUE);
+        });
+    }
+}
+
+void geode::utils::permission::requestPermission(Permission permission, geode::Function<void(bool)> callback) {
+    s_permissionCallback = std::move(callback);
+    JniMethodInfo info;
+    if (JniHelper::getStaticMethodInfo(info, "com/vod/launcher/utils/GeodeUtils", "requestPermission", "(Ljava/lang/String;)V")) {
+        jstring permString = info.env->NewStringUTF(permissionToName(permission));
+        info.env->CallStaticVoidMethod(info.classID, info.methodID, permString);
+        info.env->DeleteLocalRef(info.classID);
+        info.env->DeleteLocalRef(permString);
+    } else {
+        clearJNIException();
+    }
+}
+
+#include "../../utils/thread.hpp"
+#include <unistd.h>
+
+static std::optional<std::string> getNameFromOs() {
+    using pthread_getname_np_func = int (*)(pthread_t, char*, size_t);
+
+    auto ptr = reinterpret_cast<pthread_getname_np_func>(dlsym(RTLD_DEFAULT, "pthread_getname_np"));
+    if (!ptr) return std::nullopt;
+
+    // linux limits to 16 characters but let's be future proof!
+    char buf[64];
+    int result = ptr(pthread_self(), buf, sizeof(buf));
+    if (result != 0 || buf[0] == '\0') return std::nullopt;
+
+    return buf;
+}
+
+std::string geode::utils::thread::getDefaultName() {
+    // try to request name from the OS first, fallback to a simple format if fails
+    if (auto name = getNameFromOs()) {
+        return *name;
+    }
+
+    return fmt::format("Thread #{}", gettid());
+}
+
+void geode::utils::thread::platformSetName(ZStringView name) {
+    pthread_setname_np(pthread_self(), name.c_str());
+}
+
+std::string geode::utils::getEnvironmentVariable(ZStringView name) {
+    auto result = std::getenv(name.c_str());
+    return result ? result : "";
+}
+
+std::string geode::utils::formatSystemError(int code) {
+    return strerror(code);
+}
+
+cocos2d::CCRect geode::utils::getSafeAreaRect() {
+    static auto insets = []{
+        std::array<int, 4> insets{};
+        JniMethodInfo info;
+
+        if (JniHelper::getStaticMethodInfo(info, "com/vod/launcher/utils/GeodeUtils", "getScreenInsets", "()[I")) {
+            auto arr = reinterpret_cast<jintArray>(info.env->CallStaticObjectMethod(info.classID, info.methodID));
+
+            if (arr) {
+                auto elems = info.env->GetIntArrayElements(arr, nullptr);
+                std::copy_n(elems, 4, insets.begin());
+
+                info.env->ReleaseIntArrayElements(arr, elems, 0);
+            }
+
+            info.env->DeleteLocalRef(info.classID);
+        } else {
+            clearJNIException();
+        }
+
+        return insets;
+    }();
+    auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
+
+    auto scaleX = cocos2d::CCEGLView::sharedOpenGLView()->getScaleX();
+    auto scaleY = cocos2d::CCEGLView::sharedOpenGLView()->getScaleY();
+
+    auto insetLeft = insets[0] / scaleX;
+    auto insetBottom = insets[1] / scaleY;
+    auto insetRight = insets[2] / scaleX;
+    auto insetTop = insets[3] / scaleY;
+
+    auto insetX = std::max(insetLeft, insetRight);
+    auto insetY = std::max(insetTop, insetBottom);
+
+    return cocos2d::CCRect(insetX, insetY, winSize.width - 2 * insetX, winSize.height - 2 * insetY);
+}
+
+geode::Result<int> geode::utils::getLauncherVersion() {
+    JniMethodInfo info;
+    if (JniHelper::getStaticMethodInfo(info, "com/vod/launcher/utils/GeodeUtils", "getLauncherVersion", "()I")) {
+        auto result = info.env->CallStaticIntMethod(info.classID, info.methodID);
+        info.env->DeleteLocalRef(info.classID);
+
+        return Ok(result);
+    } else {
+        clearJNIException();
+    }
+
+    return Err("method not found");
+}
+
+double geode::utils::getInputTimestamp() {
+    return JniHelper::getPlatformTimestamp();
+}
+
+
+bool geode::utils::platform::isWine() {
+    return false;
+}
+
+// we had a 15 minute argument on lead dev chat about whether we should "hardcode" the current architecture or
+// get it somewhere. i give up i am tired as hell. i do not like hardcoding this like this but
+// god it is such a pain to not do it this way. if anyone wants to use this code in v6 arm or x86 or mips or
+// whatever please tell alk so she can bicker dank about how hardcoding it was a bad idea and now they need
+// to change this function 6 years later down the line, thanks
+const char* currentArchName() {
+    #if defined(GEODE_IS_ANDROID32)
+        return "armeabi-v7a";
+    #elif defined(GEODE_IS_ANDROID64)
+        return "arm64-v8a";
+    #else
+        #error "Unsupported architecture!"
+    #endif
+}
+
+// https://stackoverflow.com/questions/19355783/getting-os-version-with-ndk-in-c
+PlatformDetails geode::utils::platform::getDetails() {
+    PlatformDetails details;
+
+    std::array<char, PROP_VALUE_MAX+1> buffer;
+
+    int releaseVersionLength = __system_property_get("ro.build.version.release", buffer.data());
+    details.releaseVersion = std::string(buffer.data(), releaseVersionLength);
+
+    int sdkVersionLength = __system_property_get("ro.build.version.sdk", buffer.data());
+    details.sdkVersion = geode::utils::numFromString<uint32_t>(std::string(buffer.data(), sdkVersionLength)).unwrapOrDefault();
+
+    details.arch = currentArchName();
+
+    int hostArchLength = __system_property_get("ro.product.cpu.abi", buffer.data());
+    details.hostArch = std::string(buffer.data(), hostArchLength);
+
+    details.pageSize = getpagesize();
+
+    return details;
+}
+
+std::string geode::utils::platform::getString() {
+    auto details = getDetails();
+    auto hostStr = details.hostArch != details.arch ? fmt::format(", {} CPU", details.hostArch) : "";
+    return fmt::format("Android {} {} (SDK {}{})",
+        details.releaseVersion, details.arch, details.sdkVersion, hostStr);
+}

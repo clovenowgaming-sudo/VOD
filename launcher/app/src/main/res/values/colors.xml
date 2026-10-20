@@ -1,0 +1,7 @@
+<resources>
+    <color name="vod_bg">#1B1030</color>
+    <color name="vod_card">#2A1B4A</color>
+    <color name="vod_accent">#7C4DFF</color>
+    <color name="vod_text">#F5F3FF</color>
+    <color name="vod_sub">#B7A9E6</color>
+</resources>
