@@ -39,10 +39,24 @@ public final class Cocos2dxHelper {
         // same sequence as the original game activity: HSS assets first, then the apk path
         String apk = gd.getApplicationInfo().sourceDir;
         String ext = android.os.Environment.getExternalStorageDirectory().getAbsolutePath();
+        diagnoseApk(apk);
         com.customRobTop.JniToCpp.setupHSSAssets(apk, ext);
         nativeSetApkPath(apk);
         accelerometer = new Cocos2dxAccelerometer(context);
         Cocos2dxBitmap.setContext(context);
+    }
+
+    /** Logs whether the game's APK is readable by us and really contains the textures the loading screen needs. */
+    private static void diagnoseApk(String apk) {
+        try {
+            java.io.File f = new java.io.File(apk);
+            android.util.Log.i("VodLauncher", "GD apk: " + apk + " exists=" + f.exists() + " canRead=" + f.canRead() + " size=" + f.length());
+            try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(apk)) {
+                String[] probe = {"assets/game_bg_01_001.png", "assets/GJ_GameSheet.plist", "assets/GJ_LaunchSheet.plist", "assets/GJ_LaunchSheet.png"};
+                for (String n : probe) android.util.Log.i("VodLauncher", "  apk entry " + n + " -> " + (z.getEntry(n) != null));
+                android.util.Log.i("VodLauncher", "  apk entries: " + z.size());
+            }
+        } catch (Throwable t) { android.util.Log.e("VodLauncher", "apk diagnose failed", t); }
     }
 
     // ---- called from native ----
