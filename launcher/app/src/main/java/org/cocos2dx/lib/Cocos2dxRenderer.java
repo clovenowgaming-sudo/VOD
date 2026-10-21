@@ -1,6 +1,8 @@
 package org.cocos2dx.lib;
 
+import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
+import android.util.Log;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
@@ -38,6 +40,7 @@ public class Cocos2dxRenderer implements GLSurfaceView.Renderer {
 
     @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
         lastTick = System.nanoTime();
+        logGl();
         nativeInit(screenWidth, screenHeight);
         initialized = true;
     }
@@ -55,6 +58,17 @@ public class Cocos2dxRenderer implements GLSurfaceView.Renderer {
         }
         lastTick = System.nanoTime();
         nativeRender();
+    }
+
+    private static void logGl() {
+        try {
+            int[] mts = new int[1];
+            GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, mts, 0);
+            String ext = GLES20.glGetString(GLES20.GL_EXTENSIONS);
+            Log.i("VodLauncher", "GL_VERSION=" + GLES20.glGetString(GLES20.GL_VERSION) + " RENDERER=" + GLES20.glGetString(GLES20.GL_RENDERER)
+                    + " MAX_TEXTURE_SIZE=" + mts[0] + " npot=" + (ext != null && ext.contains("GL_OES_texture_npot"))
+                    + " glError=" + GLES20.glGetError());
+        } catch (Throwable t) { Log.e("VodLauncher", "logGl failed", t); }
     }
 
     public void handleOnPause() { if (initialized) nativeOnPause(); }

@@ -43,6 +43,7 @@ using Sym_t = Elf32_Sym;
 static std::string g_newPath;
 static std::string g_origPath;
 static std::atomic<int> g_failLogged{0};
+static std::atomic<int> g_apkLogged{0};
 
 static std::string redirect(const char* p) {
     if (p && !g_origPath.empty() && strncmp(p, g_origPath.c_str(), g_origPath.size()) == 0)
@@ -50,15 +51,23 @@ static std::string redirect(const char* p) {
     return p ? std::string(p) : std::string();
 }
 
+// Geode/cocos probe several search folders before falling back to the APK; those misses are normal noise.
+static bool expected_miss(const std::string& r) {
+    return r.find("/geode/unzipped/") != std::string::npos || r.find("/geode/resources/") != std::string::npos ||
+           r.find("/save/") != std::string::npos;
+}
+
 static FILE* vod_fopen(const char* path, const char* mode) {
     std::string r = redirect(path);
     FILE* f = fopen(r.c_str(), mode);
+    int e = errno;
     if (!f) {
-        int e = errno;
-        if (g_failLogged.fetch_add(1) < 80)
-            LOGW("fopen failed: %s (mode %s) errno=%d%s", r.c_str(), mode ? mode : "?", e, r != path ? " [redirected]" : "");
-        errno = e;
+        if (!expected_miss(r) && g_failLogged.fetch_add(1) < 300)
+            LOGW("fopen failed: '%s' (mode %s) errno=%d%s", r.c_str(), mode ? mode : "?", e, r != path ? " [redirected]" : "");
+    } else if (r.find(".apk") != std::string::npos && g_apkLogged.fetch_add(1) < 10) {
+        LOGI("fopen ok: %s (mode %s)", r.c_str(), mode ? mode : "?");
     }
+    errno = e;
     return f;
 }
 
